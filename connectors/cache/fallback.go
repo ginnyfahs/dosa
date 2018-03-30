@@ -100,50 +100,43 @@ func (c *Connector) Read(ctx context.Context, ei *dosa.EntityInfo, keys map[stri
 	// Read from source of truth first
 	source, sourceErr := c.Next.Read(ctx, ei, keys, dosa.All())
 	// Add the primary keys back into results map as dosa.All() does not fetch the keys
-	if sourceErr == nil && source != nil {
-		for k, v := range keys {
-			source[k] = v
-		}
+	if sourceErr == nil {
+		populateValuesWithKeys(keys, source)
 	}
 	// If we are not caching for this entity, just return
 	if !c.isCacheable(ei) {
 		return source, sourceErr
 	}
 
-	ckey := createCacheKey(ei, keys)
-	adaptedEi := adaptToKeyValue(ei)
 	// if source of truth is good, return result and write result to cache
 	if sourceErr == nil {
 		w := func() error {
-			newCtx, cancel := createContextForFallback(ctx)
-			defer cancel()
-
-			cacheKey, err := c.encoder.Encode(ckey)
-			if err != nil {
-				return err
-			}
-			cacheValue, err := c.encoder.Encode(source)
-			if err != nil {
-				return err
-			}
-			newValues := map[string]dosa.FieldValue{
-				key:   cacheKey,
-				value: cacheValue}
-
-			return c.fallback.Upsert(newCtx, adaptedEi, newValues)
+			return c.write(ctx, ei, keys, source)
 		}
 		_ = c.cacheWrite(w)
 
 		return source, sourceErr
 	}
+
+	// if source of truth fails, try the fallback. If the fallback fails,
+	// return the original error
+	return c.read(ctx, ei, keys, source, sourceErr, "READ")
+}
+
+func (c *Connector) write(ctx context.Context, ei *dosa.EntityInfo, keys map[string]dosa.FieldValue, source map[string]dosa.FieldValue) (err error) {
+	cacheKey := createCacheKey(ei, keys)
+	return c.writeKeyValueToFallback(ctx, ei, cacheKey, source)
+}
+
+func (c *Connector) read(ctx context.Context, ei *dosa.EntityInfo, keys map[string]dosa.FieldValue, source map[string]dosa.FieldValue, sourceErr error, methodName string) (values map[string]dosa.FieldValue, err error) {
 	if dosa.ErrorIsNotFound(sourceErr) {
 		return source, sourceErr
 	}
 
-	// if source of truth fails, try the fallback. If the fallback fails,
-	// return the original error
-	value, err := c.getValueFromFallback(ctx, adaptedEi, ckey)
-	c.logFallback("READ", ei.Def.Name, err)
+	cacheKey := createCacheKey(ei, keys)
+
+	value, err := c.getValueFromFallback(ctx, ei, cacheKey)
+	c.logFallback(methodName, ei.Def.Name, err)
 	if err != nil {
 		return source, sourceErr
 	}
@@ -166,32 +159,14 @@ func (c *Connector) Range(ctx context.Context, ei *dosa.EntityInfo, columnCondit
 		Token:      token,
 		Limit:      limit,
 	}
-	cacheKey, err := c.encoder.Encode(keysMap)
-
-	if err != nil {
-		cacheKey = []byte{}
+	rangeResults := rangeResults{
+		TokenNext: sourceToken,
+		Rows:      sourceRows,
 	}
-	adaptedEi := adaptToKeyValue(ei)
 
 	if sourceErr == nil {
 		w := func() error {
-			newCtx, cancel := createContextForFallback(ctx)
-			defer cancel()
-
-			rangeResults := rangeResults{
-				TokenNext: sourceToken,
-				Rows:      sourceRows,
-			}
-			cacheValue, err := c.encoder.Encode(rangeResults)
-			if err != nil {
-				return err
-			}
-			newValues := map[string]dosa.FieldValue{
-				key:   cacheKey,
-				value: cacheValue,
-			}
-
-			return c.fallback.Upsert(newCtx, adaptedEi, newValues)
+			return c.writeKeyValueToFallback(ctx, ei, keysMap, rangeResults)
 		}
 		_ = c.cacheWrite(w)
 
@@ -201,7 +176,7 @@ func (c *Connector) Range(ctx context.Context, ei *dosa.EntityInfo, columnCondit
 		return sourceRows, sourceToken, sourceErr
 	}
 
-	value, err := c.getValueFromFallback(ctx, adaptedEi, cacheKey)
+	value, err := c.getValueFromFallback(ctx, ei, keysMap)
 	c.logFallback("RANGE", ei.Def.Name, err)
 	if err != nil {
 		return sourceRows, sourceToken, sourceErr
@@ -219,6 +194,72 @@ func (c *Connector) Range(ctx context.Context, ei *dosa.EntityInfo, columnCondit
 func (c *Connector) Scan(ctx context.Context, ei *dosa.EntityInfo, minimumFields []string, token string, limit int) ([]map[string]dosa.FieldValue, string, error) {
 	// Scan will just call range with no conditions
 	return c.Range(ctx, ei, nil, minimumFields, token, limit)
+}
+
+func (c *Connector) MultiRead(ctx context.Context, ei *dosa.EntityInfo, keys []map[string]dosa.FieldValue, minimumFields []string) (results []*dosa.FieldValuesOrError, err error) {
+	// Read from source of truth first
+	source, sourceErr := c.Next.MultiRead(ctx, ei, keys, dosa.All())
+	// Add the primary keys back into results map as dosa.All() does not fetch the keys
+	if sourceErr == nil {
+		for idx, result := range source {
+			populateValuesWithKeys(keys[idx], result.Values)
+		}
+	}
+
+	// If we are not caching for this entity, just return
+	if !c.isCacheable(ei) {
+		return source, sourceErr
+	}
+
+	// if no errors from source of truth, write result to cache
+	if sourceErr == nil {
+		w := func() error {
+			for idx, result := range source {
+				if result.Error == nil {
+					c.write(ctx, ei, keys[idx], result.Values)
+				}
+			}
+			return nil
+		}
+		_ = c.cacheWrite(w)
+	}
+
+	if dosa.ErrorIsNotFound(sourceErr) {
+		return source, sourceErr
+	}
+
+	// Since this is MultiRead, even if there is no error, it might still have returned only partial results.
+	// Try to fetch the remaining keys from cache
+	multiResult := make([]*dosa.FieldValuesOrError, len(keys))
+	var useCacheResult bool
+	var wg sync.WaitGroup
+	wg.Add(len(keys))
+	for idx, result := range source {
+		// Default to the original result
+		multiResult[idx] = source[idx]
+
+		go func(idx int, keys map[string]dosa.FieldValue, source *dosa.FieldValuesOrError) {
+			defer wg.Done()
+			// Do not need to read from cache for results that had no error
+			if source.Error == nil {
+				return
+			}
+			result, err := c.read(ctx, ei, keys, source.Values, source.Error, "MULTIREAD")
+			// Keep track of if reading from cache actually had a different outcome
+			if err == nil {
+				useCacheResult = true
+			}
+			multiResult[idx] = &dosa.FieldValuesOrError{
+				Values: result,
+				Error:  err,
+			}
+		}(idx, keys[idx], result)
+	}
+	wg.Wait()
+	if useCacheResult {
+		return multiResult, nil
+	}
+	return source, sourceErr
 }
 
 // Remove deletes an entry
@@ -262,13 +303,13 @@ func (c *Connector) MultiRemove(ctx context.Context, ei *dosa.EntityInfo, multiK
 	return c.Next.MultiRemove(ctx, ei, multiKeys)
 }
 
-func (c *Connector) getValueFromFallback(ctx context.Context, ei *dosa.EntityInfo, ckey interface{}) ([]byte, error) {
-	keyValue, err := c.encoder.Encode(ckey)
+func (c *Connector) getValueFromFallback(ctx context.Context, ei *dosa.EntityInfo, key interface{}) ([]byte, error) {
+	adaptedEi := adaptToKeyValue(ei)
+	keyValue, err := c.encoder.Encode(key)
 	if err != nil {
 		return nil, err
 	}
-
-	response, err := c.fallback.Read(ctx, ei, map[string]dosa.FieldValue{key: keyValue}, dosa.All())
+	response, err := c.fallback.Read(ctx, adaptedEi, map[string]dosa.FieldValue{key: keyValue}, dosa.All())
 	if err != nil {
 		return nil, err
 	}
@@ -293,6 +334,29 @@ func (c *Connector) removeValueFromFallback(ctx context.Context, ei *dosa.Entity
 	adaptedEi := adaptToKeyValue(ei)
 	return c.fallback.Remove(newCtx, adaptedEi, map[string]dosa.FieldValue{key: cacheKey})
 
+}
+
+func (c *Connector) writeKeyValueToFallback(ctx context.Context, ei *dosa.EntityInfo, key, value interface{}) error {
+	cacheKey, err := c.encoder.Encode(key)
+	if err != nil {
+		return err
+	}
+
+	cacheValue, err := c.encoder.Encode(value)
+	if err != nil {
+		return err
+	}
+
+	newValues := map[string]dosa.FieldValue{
+		key:   cacheKey,
+		value: cacheValue,
+	}
+
+	newCtx, cancel := createContextForFallback(ctx)
+	defer cancel()
+	adaptedEi := adaptToKeyValue(ei)
+
+	return c.fallback.Upsert(newCtx, adaptedEi, newValues)
 }
 
 func (c *Connector) logFallback(method, entityName string, err error) {
@@ -367,7 +431,7 @@ func createCacheKey(ei *dosa.EntityInfo, values map[string]dosa.FieldValue) inte
 
 	// sort the keys so that we encode in a deterministic order
 	sort.Strings(keys)
-	orderedKeys := []map[string]dosa.FieldValue{}
+	var orderedKeys []map[string]dosa.FieldValue
 	for _, k := range keys {
 		orderedKeys = append(orderedKeys, map[string]dosa.FieldValue{k: values[k]})
 	}
@@ -437,4 +501,13 @@ func rawRowsAsPointers(ei *dosa.EntityInfo, values []map[string]dosa.FieldValue)
 		convertedValues = append(convertedValues, rawRowAsPointers(ei, v))
 	}
 	return convertedValues
+}
+
+// Add keys into values map. This mutates the values argument
+func populateValuesWithKeys(keys map[string]dosa.FieldValue, values map[string]dosa.FieldValue) {
+	if values != nil {
+		for k, v := range keys {
+			values[k] = v
+		}
+	}
 }
